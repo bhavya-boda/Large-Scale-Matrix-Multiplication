@@ -1,0 +1,163 @@
+# PySpark modules
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, IntegerType, FloatType, ArrayType
+
+# NumPy for handling matrix manipulations
+import numpy as np
+import time
+
+# Initialize Spark session (do this once)
+spark = SparkSession.builder.appName("StrassenMatrixMultiplication").getOrCreate()
+
+def divide_matrix(matrix_rdd, id_prefix=""):
+    """
+    Divide a given RDD matrix into four submatrices and assign unique IDs to each.
+    Also generate copies with the Mindex mapping as required for Strassen's algorithm.
+    """
+    # Collect the matrix into a local list for easier slicing
+    matrix = matrix_rdd.collect()
+    half_n = len(matrix) // 2
+
+    # Split matrix into four quadrants
+    A11 = [row[:half_n] for row in matrix[:half_n]]
+    A12 = [row[half_n:] for row in matrix[:half_n]]
+    A21 = [row[:half_n] for row in matrix[half_n:]]
+    A22 = [row[half_n:] for row in matrix[half_n:]]
+
+    # Convert submatrices back to RDD and assign prefixed keys
+    submatrices = {
+        f"{id_prefix}11": spark.sparkContext.parallelize(A11),
+        f"{id_prefix}12": spark.sparkContext.parallelize(A12),
+        f"{id_prefix}21": spark.sparkContext.parallelize(A21),
+        f"{id_prefix}22": spark.sparkContext.parallelize(A22)
+    }
+
+    # Now, generate the mapping for Mindex for the submatrices
+    A_copy_map = {  # For A blocks
+        "11": ["M1", "M3", "M5", "M6"],  # A11
+        "12": ["M5", "M7"],              # A12
+        "21": ["M2", "M6"],              # A21
+        "22": ["M1", "M2", "M4", "M7"],  # A22
+    }
+    B_copy_map = {  # For B blocks
+        "11": ["M1", "M2", "M4", "M6"],  # B11
+        "12": ["M3", "M6"],              # B12
+        "21": ["M4", "M7"],              # B21
+        "22": ["M1", "M3", "M5", "M7"],  # B22
+    }
+
+    # Create Mindex copies for each submatrix
+    M_copy_pairs = {}
+    
+    for block, m_indices in A_copy_map.items():
+        for m_index in m_indices:
+            M_copy_pairs[f"{m_index}A_{block}"] = submatrices[f"{id_prefix}{block}"]
+
+    for block, m_indices in B_copy_map.items():
+        for m_index in m_indices:
+            M_copy_pairs[f"{m_index}B_{block}"] = submatrices[f"{id_prefix}{block}"]
+
+    return submatrices, M_copy_pairs
+
+def add_matrices(matrix_A, matrix_B):
+    """
+    Adds two RDD matrices element-wise.
+    """
+    return matrix_A.zip(matrix_B).map(lambda x: [a + b for a, b in zip(x[0], x[1])])
+
+def subtract_matrices(matrix_A, matrix_B):
+    """
+    Subtracts matrix_B from matrix_A element-wise.
+    """
+    return matrix_A.zip(matrix_B).map(lambda x: [a - b for a, b in zip(x[0], x[1])])
+
+def strassen_recursive(matrix_A, matrix_B, size, id_prefix=""):
+    """
+    Recursive Strassen multiplication step. Multiplies two RDD matrices using Strassen's algorithm.
+    """
+    if size <= 1024:  # Base case, use direct multiplication
+        return mul_direct(matrix_A, matrix_B)
+
+    # Divide both matrices into four submatrices
+    A_parts, A_M_copies = divide_matrix(matrix_A, id_prefix="A")
+    B_parts, B_M_copies = divide_matrix(matrix_B, id_prefix="B")
+
+    # Calculate M1 through M7 using Strassen’s formulas
+    M1 = strassen_recursive(add_matrices(A_parts["A11"], A_parts["A22"]),
+                            add_matrices(B_parts["B11"], B_parts["B22"]),
+                            size // 2, id_prefix + "M1")
+
+    M2 = strassen_recursive(add_matrices(A_parts["A21"], A_parts["A22"]),
+                            B_parts["B11"], size // 2, id_prefix + "M2")
+
+    M3 = strassen_recursive(A_parts["A11"],
+                            subtract_matrices(B_parts["B12"], B_parts["B22"]),
+                            size // 2, id_prefix + "M3")
+
+    M4 = strassen_recursive(A_parts["A22"],
+                            subtract_matrices(B_parts["B21"], B_parts["B11"]),
+                            size // 2, id_prefix + "M4")
+
+    M5 = strassen_recursive(add_matrices(A_parts["A11"], A_parts["A12"]),
+                            B_parts["B22"], size // 2, id_prefix + "M5")
+
+    M6 = strassen_recursive(subtract_matrices(A_parts["A21"], A_parts["A11"]),
+                            add_matrices(B_parts["B11"], B_parts["B12"]),
+                            size // 2, id_prefix + "M6")
+
+    M7 = strassen_recursive(subtract_matrices(A_parts["A12"], A_parts["A22"]),
+                            add_matrices(B_parts["B21"], B_parts["B22"]),
+                            size // 2, id_prefix + "M7")
+
+    # Calculate the quadrants of the resulting matrix C
+    C11 = add_matrices(subtract_matrices(add_matrices(M1, M4), M5), M7)
+    C12 = add_matrices(M3, M5)
+    C21 = add_matrices(M2, M4)
+    C22 = add_matrices(subtract_matrices(add_matrices(M1, M3), M2), M6)
+
+    return combine_matrices(C11, C12, C21, C22)
+
+# Example Usage
+# df1 = spark.read.format("csv").option("header", "true").load("dbfs:/FileStore/shared_uploads/bodabhavya00@gmail.com/matrix_A_2048x2048_range0to100-2.csv")
+# df2 = spark.read.format("csv").option("header", "true").load("dbfs:/FileStore/shared_uploads/bodabhavya00@gmail.com/matrix_A_2048x2048_range0to100-2.csv")
+# matrix_size = 2048
+
+# Generate random matrices A and B of size n x n
+matrix_size = 2048  # Adjust this to desired size
+A = np.random.randint(10, size=(matrix_size, matrix_size)).tolist()
+B = np.random.randint(10, size=(matrix_size, matrix_size)).tolist()
+
+# Convert to RDDs
+rdd_A = spark.sparkContext.parallelize(A)
+rdd_B = spark.sparkContext.parallelize(B)
+
+def combine_matrices(C11, C12, C21, C22):
+    """
+    Combines four submatrices (C11, C12, C21, C22) into a single matrix.
+    """
+    top_row = C11.zip(C12).map(lambda x: x[0] + x[1])
+    bottom_row = C21.zip(C22).map(lambda x: x[0] + x[1])
+    return top_row.union(bottom_row)
+
+def mul_direct(A_rdd, B_rdd):
+    """
+    Perform matrix multiplication directly for small matrices when size <= basecase.
+    """
+    A_local = np.array(A_rdd.collect())
+    B_local = np.array(B_rdd.collect())
+    result_matrix = np.dot(A_local, B_local)
+    return spark.sparkContext.parallelize(result_matrix.tolist())
+
+# Execute Strassen's algorithm
+start = time.time()
+result_rdd = strassen_recursive(rdd_A, rdd_B, matrix_size)
+end = time.time()
+
+print(end-start)
+
+# Collect and display the result
+result_matrix = np.array(result_rdd.collect())
+print("Resultant Matrix C (A * B):")
+print(result_matrix)
